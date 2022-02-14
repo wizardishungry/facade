@@ -108,7 +108,6 @@ func (p *Package) Write(w io.Writer) error {
 	headerBuf.WriteString("package foo\n")
 	headerBuf.WriteString("import(\n")
 	for _, imp := range newImports {
-		// TODO: this doesn't filter unused imports
 		fmt.Fprintf(&headerBuf, "%s \"%s\"\n", imp.Name(), imp.Path())
 	}
 	headerBuf.WriteString(")\n")
