@@ -11,9 +11,12 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 )
 
-func New(packagePath string) (*Package, error) {
+const uniquePrefix = "" //"o_" // this is for functions where argument names shadow the package name ("bytes")
+
+func New(packagePath, outputPackageName string, globalMode bool) (*Package, error) {
 	fset := token.NewFileSet()
 
 	_, err := parser.ParseDir(fset, ".", nil, parser.AllErrors)
@@ -31,91 +34,154 @@ func New(packagePath string) (*Package, error) {
 		return nil, err
 	}
 
-	parts := strings.Split(packagePath, "/")
-
 	return &Package{
-		pkg:       pkg,
-		shortName: parts[len(parts)-1],
+		pkg:               pkg,
+		shortName:         ShortName(packagePath),
+		outputPackageName: outputPackageName,
+		globalMode:        globalMode,
 	}, nil
 }
 
+func ShortName(pkg string) string {
+	parts := strings.Split(pkg, "/")
+	return parts[len(parts)-1]
+}
+
 type Package struct {
-	pkg       *types.Package
-	shortName string
+	pkg                          *types.Package
+	shortName, outputPackageName string
+	globalMode                   bool
 }
 
 func (p *Package) Write(w io.Writer) error {
 	scope := p.pkg.Scope()
 
+	p.pkg.SetName(uniquePrefix + ShortName(p.pkg.Path()))
+
 	newImports := []*types.Package{
 		p.pkg,
 	}
-	// for _, pkg := range p.pkg.Imports() {
-	// 	newImports = append(newImports, pkg)
-	// }
 
 	structName := fmt.Sprintf("%sImpl", strings.Title(p.shortName))
 	interfaceName := fmt.Sprintf("%sInterface", strings.Title(p.shortName))
+	if p.globalMode {
+		structName = "Impl"
+		interfaceName = "Interface"
+	}
+
+	origAlias := uniquePrefix + p.shortName
 
 	var qf types.Qualifier = func(pkg *types.Package) string {
-		return p.shortName // TODO: should be map
+		pkg.SetName(uniquePrefix + ShortName(pkg.Path()))
+		newImports = append(newImports, pkg) //hacky
+		return pkg.Name()
 	}
 
 	var (
 		headerBuf, interfaceBuf, structBuf bytes.Buffer
+		unusedImportOnce                   sync.Once
+		unusedImportBuf                    bytes.Buffer
+		funcCount                          int
 	)
-
-	// TODO: write doc blocks here
+	// TODO: copy doc blocks from functions
 	interfaceBuf.WriteString(fmt.Sprintf("type %s interface {\n", interfaceName))
 	structBuf.WriteString(fmt.Sprintf("type %s struct {}\n", structName))
+
+NAMES:
 	for _, n := range scope.Names() {
 		o := p.pkg.Scope().Lookup(n)
 		if !o.Exported() {
 			continue
 		}
+
 		t := o.Type()
 		switch t := t.(type) {
 		case *types.Signature:
+			tStruct := t
+			unusedImportOnce.Do(func() {
+				fmt.Fprintf(&unusedImportBuf, "var _ = %s.%s\n", origAlias, o.Name())
+			})
 
-			for i := 0; i < t.TypeParams().Len(); i++ {
-				tp := t.TypeParams().At(i)
-				newImports = append(newImports, tp.Obj().Pkg())
-				// TODO: check that this works with aliased imports
+			for i := 0; i < t.Params().Len(); i++ {
+				v := t.Params().At(i)
+				name := v.Name()
+
+				typeName := strings.Split(v.Type().String(), ".")
+				if len(typeName) > 1 {
+					firstLetter := typeName[1][0:1]
+					if firstLetter != strings.ToUpper(firstLetter) {
+						fmt.Fprintf(os.Stderr, "skipping func with unexported param \"%s\" %s in %s.%s %v\n", name, typeName[1], p.pkg.Name(), o.Name(), t)
+						continue NAMES
+					}
+				}
+
+				if name == "_" || name == origAlias {
+
+					fmt.Fprintf(os.Stderr, "rename \"%s\" param in %s.%s %v\n", name, p.pkg.Name(), o.Name(), t)
+					var tmpParams []*types.Var
+					for i := 0; i < t.Params().Len(); i++ {
+						p := t.Params().At(i)
+						newName := p.Name() + "_v"
+						newP := types.NewVar(token.NoPos, p.Pkg(), newName, p.Type())
+						tmpParams = append(tmpParams, newP)
+					}
+					params := types.NewTuple(tmpParams...)
+					tStruct = types.NewSignatureType(t.Recv(), nil, nil, params, t.Results(), t.Variadic())
+				}
 			}
 
-			var buf bytes.Buffer
-			types.WriteSignature(&buf, t, qf)
-			fmt.Fprintf(&interfaceBuf, "%s %s\n", o.Name(), buf.String())
-			fmt.Fprintf(&structBuf, "func (_ %s) %s %s{\n", structName, o.Name(), buf.String())
+			{
+				var buf bytes.Buffer
+				types.WriteSignature(&buf, t, qf)
+				fmt.Fprintf(&interfaceBuf, "%s %s\n", o.Name(), buf.String())
+			}
+			{
+				var buf bytes.Buffer
+				types.WriteSignature(&buf, tStruct, qf)
+				fmt.Fprintf(&structBuf, "func (*%s) %s %s{\n", structName, o.Name(), buf.String())
+			}
 
 			if t.Results() != nil {
 				fmt.Fprintf(&structBuf, "return ")
 			}
-			fmt.Fprintf(&structBuf, "%s.%s(", p.shortName, o.Name())
+			fmt.Fprintf(&structBuf, "%s.%s(", origAlias, o.Name())
 
-			for i := 0; i < t.Params().Len(); i++ {
-				p := t.Params().At(i)
-				fmt.Fprintf(&structBuf, "%s,", p.Name())
+			for i := 0; i < tStruct.Params().Len(); i++ {
+				p := tStruct.Params().At(i)
+
+				delimit := ","
+
+				if tStruct.Variadic() && i+1 == tStruct.Params().Len() {
+					delimit = "..."
+				}
+				fmt.Fprintf(&structBuf, "%s%s", p.Name(), delimit)
 			}
 			fmt.Fprintf(&structBuf, ")\n}\n")
-
+			funcCount++
 		}
 	}
-	interfaceBuf.WriteString("}\n")
+	interfaceBuf.WriteString("}\n\n")
 
-	// TODO: write "Do not edit"
 	// TODO: support writing build tags fixating to the goos, goarch + version of go that built it
-	headerBuf.WriteString("package foo\n")
-	headerBuf.WriteString("import(\n")
-	for _, imp := range newImports {
-		fmt.Fprintf(&headerBuf, "%s \"%s\"\n", imp.Name(), imp.Path())
-	}
-	headerBuf.WriteString(")\n")
+	headerBuf.WriteString("// Code generated by a tool. DO NOT EDIT.\n\n")
+	fmt.Fprintf(&headerBuf, "// Package %s provides a mockable wrapper for %s.\n", p.shortName, p.pkg.Path())
+	fmt.Fprintf(&headerBuf, "package %s\n", p.outputPackageName)
 
+	if funcCount > 0 {
+		headerBuf.WriteString("import(\n")
+		for _, imp := range newImports {
+			fmt.Fprintf(&headerBuf, "%s \"%s\"\n", imp.Name(), imp.Path())
+		}
+		headerBuf.WriteString(")\n")
+		fmt.Fprintf(&headerBuf, "var _ %s = &%s{}\n", interfaceName, structName)
+	}
 	var buf bytes.Buffer
 	buf.Write(headerBuf.Bytes())
-	buf.Write(interfaceBuf.Bytes())
-	buf.Write(structBuf.Bytes())
+	if funcCount > 0 {
+		buf.Write(unusedImportBuf.Bytes())
+		buf.Write(interfaceBuf.Bytes())
+		buf.Write(structBuf.Bytes())
+	}
 
 	fmted, err := format.Source(buf.Bytes())
 	if err != nil {
@@ -124,4 +190,8 @@ func (p *Package) Write(w io.Writer) error {
 	}
 	_, err = w.Write(fmted)
 	return err
+}
+
+func (p *Package) ShortName() string {
+	return p.shortName
 }
